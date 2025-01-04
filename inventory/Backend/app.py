@@ -1,85 +1,132 @@
-from flask import Flask, jsonify, request
-from flask_mysqldb import MySQL
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+import mysql.connector
+from mysql.connector import pooling
+import bcrypt
+import jwt
+import datetime
+from functools import wraps
 
+# Initialize app and middleware
 app = Flask(__name__)
+CORS(app)
 
-# Database connection configuration
-app.config['MYSQL_HOST'] = 'localhost'  # or your database host
-app.config['MYSQL_USER'] = 'root'  # MySQL username
-app.config['MYSQL_PASSWORD'] = 'Sabitha@2004'  # MySQL password
-app.config['MYSQL_DB'] = 'TelecomInventory'  # Your database name
+# Configuration
+PORT = 5000
+JWT_SECRET = 'your_jwt_secret_key'  # Replace with a secure key
 
-mysql = MySQL(app)
+# MySQL connection pooling
+db_config = {
+    'host': 'localhost',
+    'user': 'root',  # Replace with your MySQL username
+    'password': 'password',  # Replace with your MySQL password
+    'database': 'inventory'  # Replace with your database name
+}
 
-# Route to get data from the 'User' table
-@app.route('/api/users', methods=['GET'])
-def get_users():
-    cursor = mysql.connection.cursor()
-    cursor.execute("SELECT * FROM User")  # Table name: User
-    users = cursor.fetchall()
-    return jsonify(users)
+connection_pool = pooling.MySQLConnectionPool(pool_name="mypool", pool_size=5, **db_config)
 
-# Route to get data from the 'Product' table
-@app.route('/api/products', methods=['GET'])
-def get_products():
-    cursor = mysql.connection.cursor()
-    cursor.execute("SELECT * FROM Product")  # Table name: Product
-    products = cursor.fetchall()
-    return jsonify(products)
+# Utility function to query the database
+def query(sql, params=None):
+    try:
+        connection = connection_pool.get_connection()
+        cursor = connection.cursor(dictionary=True)
+        cursor.execute(sql, params)
+        result = cursor.fetchall()
+        cursor.close()
+        connection.close()
+        return result
+    except mysql.connector.Error as err:
+        print(f"Error: {err}")
+        raise
 
-# Route to insert data into the 'User' table
-@app.route('/api/users', methods=['POST'])
-def insert_user():
-    user_data = request.get_json()  # Expecting JSON data
-    username = user_data['UserName']
-    password = user_data['Password']
-    first_name = user_data['FirstName']
-    last_name = user_data['LastName']
-    role = user_data['Role']
-    phone = user_data['Phone']
-    email = user_data['Email']
+# Token required decorator
+def token_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        token = None
+        if 'Authorization' in request.headers:
+            token = request.headers['Authorization'].split(' ')[1]
+        if not token:
+            return jsonify({'error': 'Token is missing'}), 403
+
+        try:
+            data = jwt.decode(token, JWT_SECRET, algorithms=['HS256'])
+            current_user = data['id']
+        except jwt.ExpiredSignatureError:
+            return jsonify({'error': 'Token has expired'}), 401
+        except jwt.InvalidTokenError:
+            return jsonify({'error': 'Invalid token'}), 403
+
+        return f(current_user, *args, **kwargs)
+    return decorated_function
+
+# Routes
+
+# User authentication
+@app.route('/register', methods=['POST'])
+def register():
+    data = request.get_json()
+    username = data['username']
+    password = data['password']
+    role = data['role']
     
-    cursor = mysql.connection.cursor()
-    cursor.execute("""
-        INSERT INTO User (UserName, Password, FirstName, LastName, Role, Phone, Email)
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
-    """, (username, password, first_name, last_name, role, phone, email))
-    
-    mysql.connection.commit()
-    cursor.close()
-    
-    return jsonify({"message": "User added successfully!"}), 201
+    try:
+        hashed_password = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())
+        query('INSERT INTO users (username, password_hash, role) VALUES (%s, %s, %s)', (username, hashed_password, role))
+        return jsonify({'message': 'User registered successfully'}), 201
+    except Exception as err:
+        return jsonify({'error': 'Error registering user'}), 400
 
-# Route to insert data into the 'Product' table
-@app.route('/api/products', methods=['POST'])
-def insert_product():
-    product_data = request.get_json()  # Expecting JSON data
-    product_name = product_data['ProductName']
-    description = product_data['Description']
-    product_image = product_data['ProductImage']
-    category = product_data['Category']
-    model_number = product_data['ModelNumber']
-    serial_number = product_data['SerialNumber']
-    stock_level = product_data['StockLevel']
-    reorder_point = product_data['ReorderPoint']
-    supplier_name = product_data['SupplierName']
-    supplier_mail = product_data['SupplierMail']
-    supplier_contact = product_data['SupplierContact']
-    order_date = product_data['OrderDate']
-    quantity = product_data['Quantity']
-    order_status = product_data['OrderStatus']
+@app.route('/login', methods=['POST'])
+def login():
+    data = request.get_json()
+    username = data['username']
+    password = data['password']
     
-    cursor = mysql.connection.cursor()
-    cursor.execute("""
-        INSERT INTO Product (ProductName, Description, ProductImage, Category, ModelNumber, SerialNumber, StockLevel, ReorderPoint, SupplierName, SupplierMail, SupplierContact, OrderDate, Quantity, OrderStatus)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-    """, (product_name, description, product_image, category, model_number, serial_number, stock_level, reorder_point, supplier_name, supplier_mail, supplier_contact, order_date, quantity, order_status))
-    
-    mysql.connection.commit()
-    cursor.close()
-    
-    return jsonify({"message": "Product added successfully!"}), 201
+    try:
+        users = query('SELECT * FROM users WHERE username = %s', (username,))
+        user = users[0] if users else None
+        if not user or not bcrypt.checkpw(password.encode('utf-8'), user['password_hash'].encode('utf-8')):
+            return jsonify({'error': 'Invalid credentials'}), 401
+        
+        token = jwt.encode({
+            'id': user['id'],
+            'role': user['role'],
+            'exp': datetime.datetime.utcnow() + datetime.timedelta(hours=1)
+        }, JWT_SECRET, algorithm='HS256')
+        
+        return jsonify({'token': token})
+    except Exception as err:
+        return jsonify({'error': 'Error logging in'}), 500
 
+# Product routes
+@app.route('/products', methods=['GET'])
+@token_required
+def get_products(current_user):
+    try:
+        products = query('SELECT * FROM products')
+        return jsonify(products)
+    except Exception as err:
+        return jsonify({'error': 'Error fetching products'}), 500
+
+@app.route('/products', methods=['POST'])
+@token_required
+def add_product(current_user):
+    data = request.get_json()
+    name = data['name']
+    category = data['category']
+    stock_level = data['stockLevel']
+    reorder_point = data['reorderPoint']
+    
+    try:
+        query(
+            'INSERT INTO products (name, category, stock_level, reorder_point) VALUES (%s, %s, %s, %s)',
+            (name, category, stock_level, reorder_point)
+        )
+        return jsonify({'message': 'Product added successfully'}), 201
+    except Exception as err:
+        return jsonify({'error': 'Error adding product'}), 400
+
+# Start the server
 if __name__ == '__main__':
-    app.run(debug=True)
-
+    app.run(port=PORT, debug=True)
